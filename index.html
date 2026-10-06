@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terrain Coverage Planner</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+:root{--bg:#1d2420;--panel:#262e29;--line:#3a453e;--ink:#e8ece6;--mute:#9aa89d;--rdr:#3fa7ff;--wpn:#ff5a4d;--trp:#ffd23f}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;font:14px/1.4 "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+#side{width:400px;max-width:46vw;overflow-y:auto;padding:14px;background:var(--panel);border-right:1px solid var(--line)}
+#map{flex:1;min-width:0}
+h1{font-size:18px;margin:0 0 10px}
+h2{font-size:13px;margin:14px 0 6px;color:var(--mute);font-weight:600}
+input{width:100%;padding:6px 7px;margin:2px 0 6px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:4px;font:inherit}
+input:focus,button:focus-visible{outline:2px solid var(--trp);outline-offset:1px}
+label{font-size:12px;color:var(--mute)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.col{padding:8px;border:1px solid var(--line);border-top-width:4px;border-radius:4px}
+.col.r{border-top-color:var(--rdr)}.col.w{border-top-color:var(--wpn)}
+.col h2{margin:0 0 6px;color:var(--ink)}
+button{width:100%;margin-top:12px;padding:10px;background:var(--trp);color:#222;border:0;border-radius:4px;font:600 14px inherit;cursor:pointer}
+button.sm{width:auto;margin:0 0 8px;padding:4px 8px;font-size:12px;font-weight:400;background:var(--line);color:var(--ink)}
+button:disabled{opacity:.5;cursor:wait}
+#bar{height:6px;background:var(--bg);border-radius:3px;margin-top:8px;overflow:hidden}
+#bar i{display:block;height:100%;width:0;background:var(--trp)}
+#msg{margin-top:8px;font-size:13px;white-space:pre-line}
+#msg.err{color:#ff8a80}
+@media(max-width:800px){body{flex-direction:column}#side{width:100%;max-width:none;max-height:55vh}}
+</style>
+</head>
+<body>
+<div id="side">
+<h1>Terrain Coverage Planner</h1>
+
+<h2>Map area: 4 corner coordinates (lat, lon)</h2>
+<input id="c1" value="31.00, 77.00" aria-label="Corner 1">
+<input id="c2" value="31.00, 77.40" aria-label="Corner 2">
+<input id="c3" value="31.30, 77.40" aria-label="Corner 3">
+<input id="c4" value="31.30, 77.00" aria-label="Corner 4">
+
+<h2>Troop location (lat, lon)</h2>
+<input id="troop" value="31.15, 77.20" aria-label="Troop">
+<button class="sm" type="button" onclick="gps('troop')">Use my GPS</button>
+
+<div class="cols">
+  <div class="col r">
+    <h2>Radar</h2>
+    <label>Name</label><input id="rn" value="Radar-1">
+    <label>Location (lat, lon)</label><input id="rp" value="31.18, 77.15">
+    <button class="sm" type="button" onclick="gps('rp')">Use my GPS</button>
+    <label>Range (km)</label><input id="rr" type="number" value="20">
+    <label>Antenna height (m)</label><input id="rh" type="number" value="10">
+    <label>Target height above ground (m)</label><input id="rt" type="number" value="100">
+  </div>
+  <div class="col w">
+    <h2>Weapon</h2>
+    <label>Name</label><input id="wn" value="Weapon-1">
+    <label>Location (lat, lon)</label><input id="wp" value="31.12, 77.22">
+    <button class="sm" type="button" onclick="gps('wp')">Use my GPS</button>
+    <label>Range (km)</label><input id="wr" type="number" value="10">
+    <label>Mount height (m)</label><input id="wh" type="number" value="4">
+    <label>Target height above ground (m)</label><input id="wt" type="number" value="100">
+  </div>
+</div>
+
+<button id="go">Generate map</button>
+<div id="bar"><i></i></div>
+<div id="msg">Enter the details and press Generate map. Elevation data is fetched online.</div>
+</div>
+<div id="map"></div>
+
+<script>
+const R = 6371000, KR = R * 4 / 3;      // earth radius, 4/3 effective radius for refraction
+const NA = 72, NS = 20;                  // azimuth rays, samples per ray
+
+const map = L.map('map').setView([31.15, 77.2], 10);
+const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'});
+const topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {maxZoom: 17, attribution: '© OpenTopoMap'});
+topo.addTo(map);
+let layer = L.layerGroup().addTo(map);
+L.control.layers({'Terrain map': topo, 'Street map': osm}, {'Results': layer}).addTo(map);
+
+const $ = id => document.getElementById(id);
+const parse = s => { const p = s.split(/[,\s]+/).filter(Boolean).map(Number); if (p.length < 2 || p.some(isNaN)) throw new Error('Bad coordinate: "' + s + '". Use: lat, lon'); return [p[0], p[1]]; };
+const status = (t, err) => { $('msg').textContent = t; $('msg').className = err ? 'err' : ''; };
+function gps(id) {
+  if (!navigator.geolocation) return status('This browser has no GPS support.', true);
+  status('Getting your location...');
+  navigator.geolocation.getCurrentPosition(
+    p => { $(id).value = p.coords.latitude.toFixed(5) + ', ' + p.coords.longitude.toFixed(5); status('Location set (accuracy about ' + Math.round(p.coords.accuracy) + ' m).'); },
+    e => status('Could not get location: ' + e.message + '. GPS works only on a secure https link, not a plain file, and needs permission allowed.', true),
+    {enableHighAccuracy: true, timeout: 20000});
+}
+const progress = f => $('bar').firstElementChild.style.width = (f * 100) + '%';
+
+function dest(lat, lon, brg, d) {
+  const p1 = lat * Math.PI / 180, l1 = lon * Math.PI / 180, t = brg * Math.PI / 180, g = d / R;
+  const p2 = Math.asin(Math.sin(p1) * Math.cos(g) + Math.cos(p1) * Math.sin(g) * Math.cos(t));
+  const l2 = l1 + Math.atan2(Math.sin(t) * Math.sin(g) * Math.cos(p1), Math.cos(g) - Math.sin(p1) * Math.sin(p2));
+  return [p2 * 180 / Math.PI, ((l2 * 180 / Math.PI + 540) % 360) - 180];
+}
+
+const sleep = ms => new Promise(s => setTimeout(s, ms));
+const providers = [
+  {name: 'Open-Topo-Data', gap: 1300,
+   url: c => 'https://api.opentopodata.org/v1/srtm30m?locations=' + c.map(p => p[0].toFixed(5) + ',' + p[1].toFixed(5)).join('|'),
+   read: j => j.results.map(r => r.elevation)},
+  {name: 'Open-Meteo', gap: 2500,
+   url: c => 'https://api.open-meteo.com/v1/elevation?latitude=' + c.map(p => p[0].toFixed(5)).join(',') + '&longitude=' + c.map(p => p[1].toFixed(5)).join(','),
+   read: j => j.elevation}
+];
+let cache = new Map();
+
+// Fetches one batch of up to 100 points. Retries with waiting, then tries the next service.
+async function batch(c) {
+  const key = c.map(p => p[0].toFixed(5) + ',' + p[1].toFixed(5)).join('|');
+  if (cache.has(key)) return cache.get(key);
+  let lastErr = 'unknown';
+  for (const p of providers) {
+    for (let tryNo = 0; tryNo < 4; tryNo++) {
+      try {
+        const r = await fetch(p.url(c));
+        if (r.ok) {
+          const v = p.read(await r.json()).map(x => (x == null ? NaN : x));
+          await sleep(p.gap);
+          cache.set(key, v);
+          return v;
+        }
+        lastErr = p.name + ' returned ' + r.status;
+        if (r.status !== 429 && r.status < 500) break;
+        status('Elevation service busy (' + p.name + '). Waiting and retrying...');
+        await sleep(4000 * (tryNo + 1));
+      } catch (e) { lastErr = p.name + ' unreachable'; await sleep(1500); }
+    }
+  }
+  throw new Error('Elevation services refused the request (' + lastErr + '). Wait a minute and try again, or reduce the range.');
+}
+
+async function elevations(pts, onStep) {
+  const out = [];
+  for (let i = 0; i < pts.length; i += 100) {
+    out.push(...await batch(pts.slice(i, i + 100)));
+    onStep(Math.min(i + 100, pts.length) / pts.length);
+  }
+  // Fill any no-data holes with the nearest previous valid height
+  let last = 0;
+  return out.map(v => { if (isNaN(v)) return last; last = v; return v; });
+}
+
+// Line-of-sight coverage: for each bearing, walk outward and stop where terrain hides the target.
+async function coverage(s, onStep) {
+  const pts = [[s.lat, s.lon]], step = s.range * 1000 / NS;
+  for (let a = 0; a < NA; a++) for (let k = 1; k <= NS; k++) pts.push(dest(s.lat, s.lon, a * 360 / NA, k * step));
+  const e = await elevations(pts, onStep);
+  const h0 = e[0] + s.ah, poly = [];
+  for (let a = 0; a < NA; a++) {
+    let maxAng = -Infinity, reach = 0, blocked = false;
+    for (let k = 1; k <= NS; k++) {
+      const d = k * step, g = e[1 + a * NS + k - 1], curve = d / (2 * KR);
+      const ground = (g - h0) / d - curve, target = (g + s.th - h0) / d - curve;
+      if (!blocked && target >= maxAng) reach = d; else blocked = true;
+      maxAng = Math.max(maxAng, ground);
+    }
+    poly.push(dest(s.lat, s.lon, a * 360 / NA, reach));
+  }
+  return {poly, ground: e[0]};
+}
+
+function inside(pt, poly) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [yi, xi] = poly[i], [yj, xj] = poly[j];
+    if ((xi > pt[1]) !== (xj > pt[1]) && pt[0] < (yj - yi) * (pt[1] - xi) / (xj - xi) + yi) c = !c;
+  }
+  return c;
+}
+
+const dot = (c, t) => L.divIcon({className: '', iconSize: [16, 16], iconAnchor: [8, 8],
+  html: `<div style="width:16px;height:16px;border-radius:${t};background:${c};border:2px solid #fff"></div>`});
+
+$('go').onclick = async () => {
+  const btn = $('go'); btn.disabled = true;
+  try {
+    const corners = ['c1', 'c2', 'c3', 'c4'].map(i => parse($(i).value));
+    const troop = parse($('troop').value);
+    const mk = (n, p, r, h, t) => { const [lat, lon] = parse($(p).value); return {name: $(n).value, lat, lon, range: +$(r).value, ah: +$(h).value, th: +$(t).value}; };
+    const sensors = [
+      {...mk('rn', 'rp', 'rr', 'rh', 'rt'), color: '#3fa7ff', shape: '50%', kind: 'Radar'},
+      {...mk('wn', 'wp', 'wr', 'wh', 'wt'), color: '#ff5a4d', shape: '2px', kind: 'Weapon'}
+    ];
+    if (sensors.some(s => !(s.range > 0))) throw new Error('Range must be greater than zero.');
+
+    layer.clearLayers();
+    const area = L.polygon(corners, {color: '#fff', weight: 2, dashArray: '6 6', fill: false}).addTo(layer);
+    map.fitBounds(area.getBounds().pad(0.1));
+
+    const lines = [];
+    for (let i = 0; i < sensors.length; i++) {
+      const s = sensors[i];
+      status('Fetching elevation for ' + s.name + ' (' + s.kind + ')...');
+      const res = await coverage(s, f => progress((i + f) / sensors.length));
+      L.circle([s.lat, s.lon], {radius: s.range * 1000, color: s.color, weight: 1, dashArray: '4 6', fill: false}).addTo(layer);
+      L.polygon(res.poly, {color: s.color, weight: 2, fillColor: s.color, fillOpacity: 0.25})
+        .bindPopup(`${s.kind}: ${s.name}<br>Range ${s.range} km<br>Ground ${Math.round(res.ground)} m`).addTo(layer);
+      L.marker([s.lat, s.lon], {icon: dot(s.color, s.shape)}).bindTooltip(s.name + ' (' + Math.round(res.ground) + ' m)').addTo(layer);
+      s.res = res;
+      lines.push(`${s.name}: troop is ${inside(troop, res.poly) ? 'INSIDE' : 'OUTSIDE'} the terrain-adjusted coverage.`);
+    }
+    L.marker(troop, {icon: dot('#ffd23f', '0')}).bindTooltip('Troop').addTo(layer);
+    progress(1);
+    status('Done. Dashed circle = ideal range; filled shape = coverage after terrain masking.\n' + lines.join('\n'));
+  } catch (err) {
+    status(err.message + (err instanceof TypeError ? ' Check your internet connection.' : ''), true);
+  }
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
